@@ -2,6 +2,17 @@
 #include <gst/app/gstappsrc.h>
 #include <string.h>
 #include "mux_renderer.h"
+#ifdef USE_AUDIOTOOLBOX_DECODER
+#include "at_decoder.h"
+/* MirrorDesk: when the sender sends no audio (between videos, during a pause),
+ * there are simply no packets. MP4 stores AAC as a sequence of fixed-length
+ * frames and ignores timestamps, so those silent stretches vanished from
+ * recordings and later sound moved earlier. Fill them with silent frames. */
+static uint8_t silent_eld_packet[2048];
+static size_t silent_eld_packet_len = 0;
+#define AAC_ELD_FRAME_NS ((GstClockTime) (480 * GST_SECOND / 44100))
+#define MAX_FILLED_GAP (30 * 60 * GST_SECOND)
+#endif
 
 #define SECOND_IN_NSECS 1000000000UL
 #define MAX_PENDING_FRAMES 1800
@@ -49,6 +60,7 @@ typedef struct mux_renderer_s {
     gboolean is_h265;
     gboolean logged_first_video;
     gboolean logged_first_audio;
+    GstClockTime next_audio_pts;   /* where the next audio frame should start */
 } mux_renderer_t;
 
 static mux_renderer_t *renderer = NULL;
@@ -127,6 +139,7 @@ static void do_start_pipeline(gboolean with_audio) {
     renderer->first_audio_time = GST_CLOCK_TIME_NONE;
     renderer->last_video_time = GST_CLOCK_TIME_NONE;
     renderer->last_audio_time = GST_CLOCK_TIME_NONE;
+    renderer->next_audio_pts = GST_CLOCK_TIME_NONE;
     renderer->audio_started = FALSE;
     renderer->is_alac = audio_is_alac;
     renderer->is_h265 = video_is_h265;
@@ -514,6 +527,31 @@ void mux_renderer_push_audio(unsigned char *data, int data_len, uint64_t ntp_tim
                    (guint64) ntp_time, (double) pts / GST_SECOND, (guint64) renderer->base_time);
         renderer->logged_first_audio = TRUE;
     }
+#ifdef USE_AUDIOTOOLBOX_DECODER
+    if (!renderer->is_alac) {
+        if (silent_eld_packet_len == 0) {
+            silent_eld_packet_len = at_make_silent_packet(AT_CT_AAC_ELD, silent_eld_packet, sizeof(silent_eld_packet));
+        }
+        GstClockTime next = renderer->next_audio_pts;
+        if (silent_eld_packet_len > 0 && next != GST_CLOCK_TIME_NONE &&
+            pts > next + AAC_ELD_FRAME_NS / 2 && pts - next < MAX_FILLED_GAP) {
+            guint filled = 0;
+            while (next + AAC_ELD_FRAME_NS / 2 < pts) {
+                GstBuffer *silence = gst_buffer_new_memdup(silent_eld_packet, silent_eld_packet_len);
+                GST_BUFFER_PTS(silence) = next;
+                GST_BUFFER_DTS(silence) = next;
+                gst_app_src_push_buffer(GST_APP_SRC(renderer->audio_appsrc), silence);
+                next += AAC_ELD_FRAME_NS;
+                filled++;
+            }
+            if (filled > 4) {
+                logger_log(logger, LOGGER_INFO, "Mux timing: filled %.2fs of silence in recording (no audio from sender)",
+                           (double) filled * AAC_ELD_FRAME_NS / GST_SECOND);
+            }
+        }
+        renderer->next_audio_pts = pts + AAC_ELD_FRAME_NS;
+    }
+#endif
     GST_BUFFER_PTS(buffer) = pts;
     GST_BUFFER_DTS(buffer) = pts;
     gst_app_src_push_buffer(GST_APP_SRC(renderer->audio_appsrc), buffer);

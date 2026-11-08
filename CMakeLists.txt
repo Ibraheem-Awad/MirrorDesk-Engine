@@ -77,9 +77,22 @@ endif()
 
 add_library( uxplay_shared SHARED uxplay.cpp )
 set_target_properties( uxplay_shared PROPERTIES OUTPUT_NAME "uxplay" )
+if ( APPLE )
+  # MirrorDesk: leave room to relink GStreamer paths into the app bundle
+  target_link_options( uxplay_shared PRIVATE "-Wl,-headerpad_max_install_names" )
+endif()
 target_link_libraries( uxplay_shared renderers airplay )
 if (DBUS_FOUND)
       target_link_libraries( uxplay_shared ${DBUS_LIBRARY})
+endif()
+
+# MirrorDesk: the engine as its own helper program (Contents/Helpers/MirrorDeskEngine).
+# The app starts it per receiver and shows the video it sends (mirrordesk_helper.c).
+add_executable( MirrorDeskEngine uxplay.cpp mirrordesk_helper.c )
+target_compile_definitions( MirrorDeskEngine PRIVATE MIRRORDESK_HELPER=1 )
+target_link_libraries( MirrorDeskEngine renderers_remote airplay )
+if ( APPLE )
+  target_link_options( MirrorDeskEngine PRIVATE "-Wl,-headerpad_max_install_names" )
 endif()
 
 add_executable( uxplay uxplay.cpp )

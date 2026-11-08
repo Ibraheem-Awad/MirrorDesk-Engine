@@ -51,7 +51,34 @@ add_library( renderers
              video_renderer.c
              mux_renderer.c )
 
-target_link_libraries ( renderers PUBLIC airplay )
+# MirrorDesk: the same renderers for the engine helper process, which sends the
+# video to the app (video_renderer_remote.c) instead of opening a window.
+add_library( renderers_remote
+             STATIC
+             audio_renderer.c
+             video_renderer_remote.c
+             mirrordesk_channel.c
+             mux_renderer.c )
+
+target_compile_definitions ( renderers_remote PRIVATE MIRRORDESK_REMOTE_VIDEO=1 )
+
+foreach ( target renderers renderers_remote )
+  target_link_libraries ( ${target} PUBLIC airplay )
+
+  # MirrorDesk: decode AirPlay audio (AAC-ELD/AAC-LC/ALAC) with Apple's AudioToolbox
+  # instead of FFmpeg/gst-libav.
+  if ( APPLE )
+    target_sources ( ${target} PRIVATE at_decoder.c )
+    target_compile_definitions ( ${target} PRIVATE USE_AUDIOTOOLBOX_DECODER=1 )
+    # MirrorDesk: rewrite H.264 SPS for low-latency decoding
+    pkg_check_modules ( GSTCODECPARSERS REQUIRED gstreamer-codecparsers-1.0>=1.22 )
+    target_sources ( ${target} PRIVATE h264_low_latency.c )
+    target_compile_definitions ( ${target} PRIVATE MIRRORDESK_LOW_LATENCY_H264=1 )
+    target_include_directories ( ${target} PRIVATE ${GSTCODECPARSERS_INCLUDE_DIRS} )
+    target_link_libraries ( ${target} PUBLIC ${GSTCODECPARSERS_LINK_LIBRARIES} )
+    target_link_libraries ( ${target} PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" )
+  endif()
+endforeach()
 
 # hacks to fix cmake confusion due to links in path with macOS FrameWorks
 
@@ -74,19 +101,24 @@ if ( APPLE AND NOT GST_MACOS )
 endif()
 
 target_include_directories ( renderers PUBLIC ${GST_INCLUDE_DIRS} )
+target_include_directories ( renderers_remote PUBLIC ${GST_INCLUDE_DIRS} )
 
 if( GST_LIBRARY_DIRS MATCHES "/Library/FrameWorks/GStreamer.framework/lib" )
   set( GST_LIBRARY_DIRS "/Library/FrameWorks/GStreamer.framework/Libraries")
   message( STATUS  "GST_LIBRARY_DIRS" ${GST_LIBRARY_DIRS} )
   target_link_libraries( renderers PUBLIC ${GST_LIBRARIES} )
+  target_link_libraries( renderers_remote PUBLIC ${GST_LIBRARIES} )
   if( CMAKE_VERSION VERSION_LESS "3.13" )
     message( FATAL_ERROR "This macOS build needs cmake >= 3.13" )
   endif()
-  target_link_directories ( renderers  PUBLIC ${GST_LIBRARY_DIRS} )  
+  target_link_directories ( renderers  PUBLIC ${GST_LIBRARY_DIRS} )
+  target_link_directories ( renderers_remote PUBLIC ${GST_LIBRARY_DIRS} )
 elseif( CMAKE_VERSION VERSION_LESS "3.12" )
-  target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )  
+  target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )
+  target_link_libraries ( renderers_remote PUBLIC ${GST_LIBRARIES} )
 else()		  
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
+  target_link_libraries( renderers_remote PUBLIC ${GST_LINK_LIBRARIES} )
 endif()
 
 

@@ -24,6 +24,14 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
+#ifdef USE_AUDIOTOOLBOX_DECODER
+/* MirrorDesk: compressed AirPlay audio is decoded with Apple's AudioToolbox
+ * (see at_decoder.c) and pushed into the pipeline as raw PCM, so no
+ * FFmpeg/gst-libav decoder is needed. */
+#include "at_decoder.h"
+static at_decoder_t *at_decoders[4] = { NULL, NULL, NULL, NULL };
+static uint8_t at_pcm[32768];
+#endif
 #define SECOND_IN_NSECS 1000000000UL
 
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
@@ -70,8 +78,17 @@ static const char aac_eld_caps[] ="audio/mpeg,mpegversion=(int)4,channels=(int)2
 static gboolean check_plugins (void)
 {
     GstRegistry *registry = NULL;
+#if defined(USE_AUDIOTOOLBOX_DECODER) && defined(MIRRORDESK_REMOTE_VIDEO)
+    /* MirrorDesk helper: the app decodes and shows the video */
+    const gchar *needed[] = { "app", "autodetect", "videoparsersbad", NULL};
+    const gchar *gst[] = {"plugins-base", "plugins-good", "plugins-bad", NULL};
+#elif defined(USE_AUDIOTOOLBOX_DECODER)
+    const gchar *needed[] = { "app", "autodetect", "videoparsersbad", "applemedia", NULL};
+    const gchar *gst[] = {"plugins-base", "plugins-good", "plugins-bad", "plugins-bad", NULL};
+#else
     const gchar *needed[] = { "app", "libav", "playback", "autodetect", "videoparsersbad",  NULL};
     const gchar *gst[] = {"plugins-base", "libav", "plugins-base", "plugins-good", "plugins-bad", NULL};
+#endif
     registry = gst_registry_get ();
     gboolean ret = TRUE;
     for (int i = 0; i < g_strv_length ((gchar **) needed); i++) {
@@ -138,8 +155,18 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
 
     logger = render_logger;
     
+#ifdef USE_AUDIOTOOLBOX_DECODER
+    at_decoders[0] = at_decoder_create(AT_CT_AAC_ELD);
+    at_decoders[1] = at_decoder_create(AT_CT_ALAC);
+    at_decoders[2] = at_decoder_create(AT_CT_AAC_LC);
+    aac = (at_decoders[0] != NULL && at_decoders[2] != NULL);
+    alac = (at_decoders[1] != NULL);
+    if (!aac) logger_log(logger, LOGGER_ERR, "AudioToolbox AAC decoder unavailable");
+    if (!alac) logger_log(logger, LOGGER_ERR, "AudioToolbox ALAC decoder unavailable");
+#else
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
+#endif
 
     for (int i = 0; i < NFORMATS ; i++) {
         renderer_type[i] = (audio_renderer_t *)  calloc(1,sizeof(audio_renderer_t));
@@ -149,10 +176,14 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         switch (i) {
         case 0:    /* AAC-ELD */
         case 2:    /* AAC-LC */
+#ifndef USE_AUDIOTOOLBOX_DECODER
             if (aac) g_string_append(launch, "avdec_aac ! ");
+#endif
             break;
         case 1:    /* ALAC */
+#ifndef USE_AUDIOTOOLBOX_DECODER
             if (alac) g_string_append(launch, "avdec_alac ! ");
+#endif
             break;
         case 3:   /*PCM*/
             break;
@@ -229,10 +260,21 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         default:
             break;
         }
+#ifdef USE_AUDIOTOOLBOX_DECODER
+        gst_caps_unref(caps);
+        caps = gst_caps_from_string(lpcm_caps);
+#endif
         logger_log(logger, LOGGER_DEBUG, "Audio format %d: %s",i+1,format[i]);
         logger_log(logger, LOGGER_DEBUG, "GStreamer audio pipeline %d: \"%s\"", i+1, launch->str);
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+#ifdef USE_AUDIOTOOLBOX_DECODER
+        /* MirrorDesk: never let queued audio pile up behind the picture. If playback
+         * falls behind, drop the oldest audio instead of letting the delay grow
+         * (which made sound keep playing long after the video was paused). */
+        g_object_set(renderer_type[i]->appsrc, "max-time", (guint64) (2 * GST_SECOND),
+                     "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM, NULL);
+#endif
         gst_caps_unref(caps);
         g_object_unref(clock);
     }
@@ -291,12 +333,18 @@ void  audio_renderer_start(unsigned char *ct) {
             gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
             logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
             renderer = renderer_type[id];
+#ifdef USE_AUDIOTOOLBOX_DECODER
+            if (at_decoders[id]) at_decoder_reset(at_decoders[id]);
+#endif
             gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
             gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
         }
     } else if (id >= 0) {
         logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
         renderer = renderer_type[id];
+#ifdef USE_AUDIOTOOLBOX_DECODER
+        if (at_decoders[id]) at_decoder_reset(at_decoders[id]);
+#endif
         gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
         gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
     } else {
@@ -363,9 +411,46 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         valid = true;
         break;
     }
+#ifdef USE_AUDIOTOOLBOX_DECODER
+    if (valid && renderer->ct != 1) {
+        int slot = (renderer->ct == 8) ? 0 : (renderer->ct == 2) ? 1 : (renderer->ct == 4) ? 2 : -1;
+        int pcm_len = (slot >= 0 && at_decoders[slot])
+            ? at_decoder_decode(at_decoders[slot], data, (size_t) *data_len, at_pcm, sizeof(at_pcm)) : -1;
+        if (pcm_len <= 0) {
+            gst_buffer_unref(buffer);
+            return;   /* undecodable frame: skip it, keep the stream alive */
+        }
+        GstBuffer *pcm = gst_buffer_new_allocate(NULL, (gsize) pcm_len, NULL);
+        g_assert(pcm != NULL);
+        GST_BUFFER_PTS(pcm) = GST_BUFFER_PTS(buffer);
+        GST_BUFFER_DURATION(pcm) = gst_util_uint64_scale((guint64) pcm_len / 4, GST_SECOND, 44100);
+        gst_buffer_fill(pcm, 0, at_pcm, (gsize) pcm_len);
+        gst_buffer_unref(buffer);
+        buffer = pcm;
+    }
+#endif
+    if (valid && sync) {
+        /* MirrorDesk diagnostic (every ~3 s): how far ahead of "now" this audio is
+         * timestamped, and how much is waiting in the queue. */
+        static gint64 last_timing_log_us = 0;
+        gint64 now_us = g_get_monotonic_time();
+        if (now_us - last_timing_log_us > 3 * G_USEC_PER_SEC) {
+            last_timing_log_us = now_us;
+            GstClock *clock = gst_element_get_clock(renderer->appsrc);
+            if (clock) {
+                GstClockTime running = gst_clock_get_time(clock) - gst_audio_pipeline_base_time;
+                guint64 queued = 0;
+                g_object_get(renderer->appsrc, "current-level-time", &queued, NULL);
+                logger_log(logger, LOGGER_INFO, "MirrorDesk Debug: audio timing lead=%" G_GINT64_FORMAT " ms queued=%" G_GUINT64_FORMAT " ms",
+                           (gint64) (GST_CLOCK_DIFF(running, pts) / GST_MSECOND), queued / GST_MSECOND);
+                gst_object_unref(clock);
+            }
+        }
+    }
     if (valid) {
         gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
     } else {
+        gst_buffer_unref(buffer);
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
     }
@@ -380,11 +465,31 @@ void audio_renderer_set_volume(double volume) {
     g_object_set(renderer->volume, "volume", volume, NULL);
 }
 
+/* MirrorDesk: the sender asks for a flush when playback is paused, seeks or
+ * skips. Drop the audio already queued (and the decoder's state) so sound stops
+ * with the picture instead of playing out what had been sent ahead. */
 void audio_renderer_flush() {
+    if (!renderer || !renderer->pipeline) {
+        return;
+    }
+    logger_log(logger, LOGGER_INFO, "MirrorDesk Debug: audio flush requested by sender (dropping queued audio)");
+    gst_element_send_event(renderer->pipeline, gst_event_new_flush_start());
+    gst_element_send_event(renderer->pipeline, gst_event_new_flush_stop(FALSE));
+#ifdef USE_AUDIOTOOLBOX_DECODER
+    for (int i = 0; i < 4; i++) {
+        if (at_decoders[i]) at_decoder_reset(at_decoders[i]);
+    }
+#endif
 }
 
 void audio_renderer_destroy() {
     audio_renderer_stop();
+#ifdef USE_AUDIOTOOLBOX_DECODER
+    for (int i = 0; i < 4; i++) {
+        at_decoder_destroy(at_decoders[i]);
+        at_decoders[i] = NULL;
+    }
+#endif
     for (int i = 0; i < NFORMATS ; i++ ) {
         gst_object_unref (renderer_type[i]->bus);
         renderer_type[i]->bus = NULL;

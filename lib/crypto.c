@@ -624,3 +624,17 @@ void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len)
     memcpy(pk_base64,(*bufferPtr).data, len64);
 }
   
+
+
+void crypto_init_for_unloadable_engine(void) {
+    /* Must be the first OpenSSL call: no atexit() handler pointing into this library */
+    OPENSSL_init_crypto(OPENSSL_INIT_NO_ATEXIT | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+}
+
+void crypto_thread_stop(void) {
+    OPENSSL_thread_stop();
+}
+
+void crypto_cleanup_for_unload(void) {
+    OPENSSL_cleanup();
+}

@@ -118,6 +118,14 @@ void md5_reset(md5_ctx_t *ctx);
 void md5_destroy(md5_ctx_t *ctx);
 char *get_md5(char *string);
   
+/* MirrorDesk: the engine runs inside the app and is unloaded after each session.
+ * OpenSSL normally registers an atexit() handler and pins its library in memory;
+ * these let the engine start OpenSSL without the atexit() handler and shut it down
+ * cleanly before the library is unloaded. */
+void crypto_init_for_unloadable_engine(void);
+void crypto_thread_stop(void);
+void crypto_cleanup_for_unload(void);
+
 #ifdef __cplusplus
 }
 #endif

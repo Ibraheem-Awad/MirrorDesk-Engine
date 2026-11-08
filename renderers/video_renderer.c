@@ -22,6 +22,9 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#ifdef MIRRORDESK_LOW_LATENCY_H264
+#include "h264_low_latency.h"
+#endif
 #include "video_renderer.h"
 
 #define SECOND_IN_NSECS 1000000000UL
@@ -443,6 +446,13 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 g_string_append(launch, " ! ");
                 if (!rtp) {
                     g_string_append(launch, decoder);
+                    if (strncmp(decoder, "vtdec", 5) == 0) {
+                        /* MirrorDesk: have VideoToolbox hand over regular frames rather than its
+                         * own GL textures. Its texture pool is not resized when the stream
+                         * changes size (device rotation), which made portrait frames draw inside
+                         * landscape-sized textures (a smeared strip and wrong scaling). */
+                        g_string_append(launch, " ! video/x-raw");
+                    }
                 } else {
                     g_string_append(launch, "rtph264pay ");
                     g_string_append(launch, rtp_pipeline);
@@ -710,13 +720,26 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
             logger_log(logger, LOGGER_DEBUG, "*** no video renderer found");
             return 0;
         }
-        buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
+#ifdef MIRRORDESK_LOW_LATENCY_H264
+        /* MirrorDesk: declare "no frame reordering" in each H.264 SPS so the
+         * VideoToolbox decoder shows frames immediately (see h264_low_latency.c) */
+        uint8_t *low_latency = NULL;
+        int low_latency_len = 0;
+        if (*data_len > 4 && (data[4] & 0x1f) == 7 &&
+            h264_low_latency_rewrite(data, *data_len, &low_latency, &low_latency_len)) {
+            buffer = gst_buffer_new_wrapped(low_latency, (gsize) low_latency_len);
+        } else
+#endif
+        {
+            buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
+            g_assert(buffer != NULL);
+            gst_buffer_fill(buffer, 0, data, *data_len);
+        }
         g_assert(buffer != NULL);
         //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
         if (sync) {
             GST_BUFFER_PTS(buffer) = pts;
         }
-        gst_buffer_fill(buffer, 0, data, *data_len);
         GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
         if (flow != GST_FLOW_OK) {
             GstState state = GST_STATE_NULL;
@@ -907,8 +930,11 @@ void video_renderer_destroy() {
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
+            renderer_type[i] = NULL;
         }
     }
+    /* video_renderer_destroy_instance() only cleared its own parameter */
+    renderer = NULL;
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {

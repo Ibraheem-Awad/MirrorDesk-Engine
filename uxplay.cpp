@@ -2555,6 +2555,13 @@ extern "C" void conn_destroy (void *cls) {
         if (mux_to_file.load()) {
             mux_renderer_stop();
         }
+#ifdef MIRRORDESK_HELPER
+        /* MirrorDesk: the last client is gone (some clients end the session
+         * without a mirroring TEARDOWN): tell the app to close the window. */
+        if (use_video) {
+            video_renderer_stop();
+        }
+#endif
     }
 }
 
@@ -3326,10 +3333,14 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
 #include <gst/gstmacos.h>
 void real_main (int argc, char *argv[]);
 
+#ifndef MIRRORDESK_HELPER
+/* (MirrorDesk's helper process has its own main(), see mirrordesk_helper.c:
+ * it never starts an NSApplication, so it has no Dock icon or windows.) */
 int main (int argc, char *argv[]) {
     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
 }
+#endif
 
 void real_main (int argc, char *argv[]) {
 #else
@@ -3586,8 +3597,10 @@ int main (int argc, char *argv[]) {
     }
 
     if (!gstreamer_init()) {
-        LOGE ("stopping");
-        exit (1);
+        LOGE ("stopping: GStreamer could not be initialized (missing plugins?)");
+        /* MirrorDesk runs this engine inside the app: return instead of exit() so a
+         * GStreamer problem stops mirroring with an error rather than quitting the app. */
+        return;
     }
 
     render_logger = logger_init();
@@ -3864,7 +3877,32 @@ extern "C" void uxplay_stop_direct_recording() {
 
 void real_main(int argc, char *argv[]);
 
+/* MirrorDesk: the app dlopen()s this engine for each mirroring session and
+ * dlclose()s it afterwards, so every session starts with fresh state. For the
+ * library to really unload, nothing may keep pointing into it: */
+static struct sigaction saved_sigint, saved_sigterm, saved_sighup;
+static bool saved_signal_handlers = false;
+
 extern "C" int uxplay_entry(int argc, char *argv[]) {
+    crypto_init_for_unloadable_engine();
+    if (!saved_signal_handlers) {
+        sigaction(SIGINT, NULL, &saved_sigint);
+        sigaction(SIGTERM, NULL, &saved_sigterm);
+        sigaction(SIGHUP, NULL, &saved_sighup);
+        saved_signal_handlers = true;
+    }
     real_main(argc, argv);
+    crypto_thread_stop();   /* free this thread's OpenSSL state */
     return 0;
+}
+
+/* Call once the engine has returned, right before dlclose(): restores the app's
+ * signal handlers (the engine installs its own) and shuts OpenSSL down. */
+extern "C" void uxplay_prepare_unload(void) {
+    if (saved_signal_handlers) {
+        sigaction(SIGINT, &saved_sigint, NULL);
+        sigaction(SIGTERM, &saved_sigterm, NULL);
+        sigaction(SIGHUP, &saved_sighup, NULL);
+    }
+    crypto_cleanup_for_unload();
 }
